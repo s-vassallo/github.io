@@ -1,0 +1,308 @@
+#Check Modules are available
+######=Requires  SharePointPnPPowerShellOnline
+
+<#
+.SYNOPSIS
+This script retrieves informaion about all of the team sites in your tennant
+
+    <Description of the script>
+.PARAMETER <ParameterName>
+    None as yet - just edit the start variable
+.NOTES
+    <Additional notes>
+.EXAMPLE
+    Just run from the powershell command
+
+.Prerequisites
+ 
+Need PnP Powershell module
+Powershell Core V7.2 or later
+#>
+
+
+## Start Vairiables
+
+$startPosition = 0 #This is the start position variable - use this so that you don't have to restart in the event of a crash
+$golbalAdminUserEmail = ".com.au" # This is the email address of the global admin account
+
+$golbalAdminUserEmail = "com.au" #Admin account SP and Teams
+
+$tenantURL = "https://TENANT.sharepoint.com/"
+$ndate =  Get-Date 
+$outputFilePath = ".\SitePPR" + $ndate.year + $ndate.Month + $ndate.Day + $ndate.Hour + $ndate.Minute + ".csv" #This is whenre your output file will go
+#$reuseConnection = Connect-PnPOnline -Url $tenantURL -Interactive 
+$reuseConnection = Connect-PnPOnline -Url $tenantURL -Interactive -ReturnConnection #Connect here and re-use so that we can use the clientID later
+
+## Get all of the sites that are assocated with Team Sites that are creared using M365 Groups 
+$allGroupSites = Get-PnPTenantSite -Template "GROUP#0" -Connection $reuseConnection 
+
+## Set up an object to hold all the information gathered, this will bve used to genrate as csv file later
+$objAllData = @()
+
+#Set Counters for progress
+$totalNumSitesToReview = $allGroupSites.Count
+#Start with Zero reviewed, adjust this later if the script fails
+$NumerofSitesReviewed = 0
+
+# Now loop through all of the sites found for the template
+foreach ($site in $allGroupSites){
+
+    
+    $NumerofSitesReviewed +=1
+
+    if ($startPosition -lt $NumerofSitesReviewed)
+    {
+    
+    Write-Host "Analysing Site ($NumerofSitesReviewed\$totalNumSitesToReview)" -NoNewLine
+    #This variable tracks as to whether or not the global admin account had to be added in as an owner
+    $wasGlobalAdminAddedAsOwner = $false 
+
+    # Connect to your SharePoint Online tenant for site - not sure if this is the most efficient
+    Write-Host " $($Site.Url)" -NoNewLine
+
+
+    # Connect to SharePoint Online - most common reason for failure is no permssions this will add admin as a site collection admin of ot errors
+    try {
+        # Try to connect - will error if the global admin has no access to the site        
+        Connect-PnPOnline -Url $Site.Url -Interactive -ClientId $reuseConnection.ClientId 
+        ## Try something to make it fail - this next command requires site access
+        $web = Get-PnPWeb -Includes RoleAssignments, AssociatedMemberGroup, AssociatedOwnerGroup, AssociatedVisitorGroup
+        Write-Host " Successfully connected to SharePoint Online!" -ForegroundColor Green
+    }
+    catch {
+        ## Set global admin as an owner - this is only for the duration of looking at this site
+        Set-PnPSite -Owners $golbalAdminUserEmail 
+
+        # Set the flag for later use to remove the admin at then end of the loop
+        $wasGlobalAdminAddedAsOwner = $true
+
+    }
+
+    
+
+    #Retry to get the web if failed before
+    if(!$web)
+    {
+        #Get the specific web - note we have tried this already, but it may have failed before
+        $web = Get-PnPWeb -Includes RoleAssignments, AssociatedMemberGroup, AssociatedOwnerGroup, AssociatedVisitorGroup
+        #$web = Get-PnPWeb -Includes RoleAssignments
+    }
+
+    #### Get any Sharing Links  here
+    $sharingLinksList = Get-PnPList | Where-Object { $_.Title -eq "Sharing Links" }
+    
+    #Get all of the shating links
+    if ($sharingLinksList){
+        $numberofLinksShared = $sharingLinksList.ItemCount
+    }
+    else {
+        $numberofLinksShared = 0
+    }
+    
+    #Get all of the sharepoint groups
+    $allSharePointGroups = Get-PnPSiteGroup
+
+    # Remove all that are not custom grouos
+    $allAddedSharePointGroups = $allSharePointGroups | Where-Object {
+        $_.Title -notlike "*$($web.AssociatedMemberGroup.title)*" -and
+        $_.Title -notlike "*$($web.AssociatedOwnerGroup.title)*" -and
+        $_.Title -notlike "*$($web.AssociatedVisitorGroup.title)*" -and
+        $_.OwnerTitle -notlike "System Account"
+    }
+
+    # We just report how meny there are at this stage
+    $NumCustSPGrps = $allAddedSharePointGroups.count
+    
+
+    $associatedGroup = $null
+    #Try to get the M365 Group for this site
+    $associatedGroup = Get-PnPMicrosoft365Group |Where-Object { $_.DisplayName -eq $web.Title}
+
+    #if we got a group back check
+    if ($associatedGroup){
+        # Count and store the Member and Owners 
+        $siteM365GroupOwners = (Get-PnPMicrosoft365GroupOwner -Identity $associatedGroup.GroupId).Count
+        $siteM365GroupMembers = (Get-PnPMicrosoft365GroupMembers -Identity $associatedGroup.GroupId).Count 
+    }
+    else {
+        $siteM365GroupOwners = "No M365 Group"
+        $siteM365GroupMembers= "No M365 Group"
+    }   
+
+    #This is the number of users with a direct grant on to the site, detected so far
+    $siteusersDirectGrant = 0
+    # This is the number of AD groups with a direct grant on to the sit, detected so far
+    $siteADGroupsDirectGrant = 0
+    ## A variable to see if the site has been shared with the everyone except external users group
+    $allUsersGrant = $false
+
+    #Let's search for direct assignments at the Site level
+    foreach ($ra in $web.RoleAssignments) {
+        $member = $ra.Member
+        $loginName = Get-PnPProperty -ClientObject $member -Property LoginName
+
+        ## If the login name contains |tenant then it's an AD Group
+        if($loginName.Contains("|tenant"))
+        {
+            #We detected a direct grant to an AD goup so add one to site direct grant
+            $siteADGroupsDirectGrant +=1
+        }
+
+        ## If the login name contains |membership then it's an user (only user have membership)
+        if($loginName.Contains("|membership"))
+        {
+            #We detected a direct grant to an user so add one to site direct grant
+            $siteusersDirectGrant+=1
+        }
+
+        ## If the login name contains |membership then it's an user (only user have membership)
+        if($loginName.Contains("spo-grid-all-users"))
+        {
+            #Someone shared will all but external users - Add one to site direct grant
+            $allUsersGrant = $true
+        }
+
+    }
+
+    #### Next section gets the Member, Owners and Visitors with direct grants
+
+    # Get group names
+    $siteMembersGroupName = $web.AssociatedMemberGroup
+    $siteOwnersGroupName = $web.AssociatedOwnerGroup
+    $siteVisitorsGroupName = $web.AssociatedVisitorGroup
+
+
+    ##Get the number  of members for the SahrePoint default group
+    $SPGroupMembers = $null
+
+    # This is just to surpress the error message
+    try{
+        $SPGroupMembers= Get-PnPGroupMember -Identity $siteMembersGroupName | Measure-Object -ErrorAction SilentlyContinue
+    } catch {}
+    
+     
+    $SPGroupOwners = $null
+    try{
+        $SPGroupOwners = Get-PnPGroupMember -Identity $siteOwnersGroupName | Measure-Object -ErrorAction SilentlyContinue
+    } catch {}
+
+ 
+    
+    $visitors = $null
+
+    try{
+        $visitors = Get-PnPGroupMember -Identity $siteVisitorsGroupName | Measure-Object -ErrorAction SilentlyContinue
+    } catch {} 
+
+
+###### All Owners and Visitors with direct grants have been found now 
+
+###### Looking for all items with Unique permissions now and al litems count in the site
+
+    # Get all lists from given SharePoint Site collection, template 101 should include document and list 100
+    ## Exclude by name some of the built in lists - this is rather crude but we don't want the system lists
+    $allLists = Get-PnPList -Includes HasUniqueRoleAssignments,RoleAssignments | Where-Object { $_.BaseTemplate -eq 100 -or $_.BaseTemplate -eq 101 -and $_.Title -ne "Content type publishing error log" -and $_.Title -ne "Form Templates" -and $_.Title -ne "Site Assets" -and $_.Title -ne "TaxonomyHiddenList" -and $_.Title -ne "Style Library"}
+ 
+    # Define variables to count the ourput
+    # Start at zero item - all unique items
+    $totalNumberUniqueItems = 0
+    #All Items 
+    $totalNumberAlltems = 0
+    #All Uniquie lists
+    $numUniqueLists = 0
+    
+    # Loop through each list in the site
+    foreach ($list in $allLists) {
+        #
+        if (($list.HasUniqueRoleAssignments -eq $true)) {
+            
+            ## We found a list with unique permissions so add it
+            $numUniqueLists +=1
+
+            # Get all the items in the list
+            #$items = Get-PnPListItem -List $list -Includes HasUniqueRoleAssignments
+            $items = Get-PnPListItem -List $list -PageSize 2000
+            $uniqueItems  = @()
+            foreach ($ListItem in $items)
+            {
+                $HasUniquePermissions = Get-PnPProperty -ClientObject $ListItem -Property "HasUniqueRoleAssignments"
+                If($HasUniquePermissions)
+                {
+                    #Write-Host -f Green "List Item '$($ListItem["Title"])' with ID '$($ListItem.ID)' has Unique Permissions"
+                    $uniqueItems += $ListItem
+                }
+                #Else
+                #{
+                #    #Write-Host -f Yellow "List Item '$($ListItem["Title"])' with ID '$($ListItem.ID)' is inhering Permissions from its Parent"
+                #}
+            }
+            # Find the ones with unique permissions
+
+            # Keep adding so that we get all of the all the items with unique permissions
+            $totalNumberUniqueItems += $uniqueItems.Count
+        }
+        #Always add in the items to the list - we want all of them - this is for site sizing informatiom
+        $totalNumberAlltems += $items.Count
+    }
+
+    #Get site senstivityLabel
+    $siteSensitivityLabel = Get-PnPSiteSensitivityLabel  
+    if (!$siteSensitivityLabel.DisplayName) 
+    {
+        $siteSensitivityLabel = "<NA>"
+    }
+
+    ## Build and object for output to CSV
+    $objSiteInfo =[PSCustomObject]@{
+        SiteURL = $web.Url
+        SiteAllUserGrant = $allUsersGrant
+        siteSensitivityLabel = $siteSensitivityLabel -eq "<NA>" ? $siteSensitivityLabel : $siteSensitivityLabel.DisplayName
+        NumberofItems = $totalNumberAlltems
+        NumberofOwnersSPGroup = $SPGroupOwners.Count
+        NumberofMembersSPGroup = $SPGroupMembers.Count
+        NumberofVisitorsSPGroup = $visitors.Count
+        TotalNubmLists = $allLists.Count
+        NumberofListsWUP = $numUniqueLists
+        NumberofItemsWUP = $totalNumberUniqueItems
+        siteGroupsDirectGranted = $siteADGroupsDirectGrant
+        siteUsersDirectGranted = $siteusersDirectGrant
+        M365Members = $siteM365GroupMembers
+        M365Owners = $siteM365GroupOwners
+        CustomSiteGroupCount = $NumCustSPGrps
+        NumberofLinksShared = $numberofLinksShared
+
+    }
+
+    ## add it to the array
+    $objAllData += $objSiteInfo
+    #Write-Host "URL: $($web.Url) SharePoint Owners: $($SPGroupOwners.Count) SharePoint Members: $($SPGroupMembers.Count) M365 Members: $siteM365GroupMembers M365 Owner: $siteM365GroupOwners All User Granted: $allUsersGrant"
+    Write-Host "URL: " -f yellow -NoNewLine 
+    Write-Host "$($web.Url) " -f cyan -NoNewLine
+    Write-Host "SharePoint Owners: " -f yellow -NoNewLine 
+    Write-Host "$($SPGroupOwners.Count) " -f cyan -NoNewLine
+    Write-Host "SharePoint Members: " -f yellow -NoNewLine 
+    Write-Host "$($SPGroupMembers.Count) "  -f cyan -NoNewLine
+    Write-Host "M365 Members: " -f yellow -NoNewLine 
+    Write-Host "$siteM365GroupMembers " -f cyan -NoNewLine
+    Write-Host "M365 Owner: " -f yellow -NoNewLine 
+    Write-Host "$siteM365GroupOwners " -f cyan -NoNewLine
+    Write-Host "All User Granted: " -f yellow -NoNewLine 
+    Write-Host "$allUsersGrant" -f cyan
+
+    #Remove any temp admin
+    if($wasGlobalAdminAddedAsOwner)
+    {
+        Remove-PnPSiteCollectionAdmin -Owners $golbalAdminUserEmail  
+    }
+    
+    #output log in current itteration to save data captured.
+    $objAllData | Export-Csv -NoTypeInformation $outputFilePath -Encoding UTF8
+
+    #### Reset the Web to NULL
+    $web = $null
+}
+}
+
+#Finally output all the data to a csv file
+$objAllData | Export-Csv -NoTypeInformation $outputFilePath -Encoding UTF8
+
