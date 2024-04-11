@@ -1,0 +1,213 @@
+#Check Modules are available
+######=Requires  SharePointPnPPowerShellOnline
+
+<#
+.SYNOPSIS
+This script retrieves size and versioning and path information for all of the files in you tenenat
+.PARAMETER <ParameterName>
+    None as yet - just edit the start variables which are for the tenant connection and 
+    the $LargeFileSizeLowerLimit which will determine the threshold abive which to detect files
+.NOTES
+    <Additional notes>
+.EXAMPLE
+    Just run from the powershell command
+
+.Prerequisites
+ 
+Need PnP Powershell module
+Powershell Core V7.2 or later
+#>
+
+
+## Start Variables
+
+$startPosition = 0 #This is the start position variable - use this so that you don't have to restart in the event of a crash
+$golbalAdminUserEmail = "com.au" # This is the email address of the global admin account
+$tenantURL = "https://TENANT.sharepoint.com/"
+$ndate =  Get-Date 
+$outputFilePath = ".\SiteLargeFiles" + $ndate.year + $ndate.Month + $ndate.Day + $ndate.Hour + $ndate.Minute + ".csv" #This is whenre your output file will go
+#$reuseConnection = Connect-PnPOnline -Url $tenantURL -Interactive 
+$reuseConnection = Connect-PnPOnline -Url $tenantURL -Interactive -ReturnConnection #Connect here and re-use so that we can use the clientID later
+$LargeFileSizeLowerLimit = 524288000 #500MB 
+#$LargeFileSizeLowerLimit = 10971520 
+
+
+## Get all of the sites within the tenant
+$allTenantSites = Get-PnPTenantSite -Connection $reuseConnection 
+
+## Set up an object to hold all the information gathered, this will bve used to genrate as csv file later
+$objAllData = @()
+
+#Set Counters for progress
+$totalNumSitesToReview = $allTenantSites.Count
+#Start with Zero reviewed, adjust this later if the script fails
+$NumerofSitesReviewed = 0
+
+# Now loop through all of the sites found for the template - we can look at input or restriction
+# Maybe just restrict on site size threshold
+foreach ($site in $allTenantSites)
+{
+
+    
+    $NumerofSitesReviewed +=1
+
+    if ($startPosition -lt $NumerofSitesReviewed)
+    {
+    
+        Write-Host "Analysing Site ($NumerofSitesReviewed\$totalNumSitesToReview)" -NoNewLine
+        #This variable tracks as to whether or not the global admin account had to be added in as an owner
+        $wasGlobalAdminAddedAsOwner = $false 
+
+        # Connect to your SharePoint Online tenant for site - not sure if this is the most efficient
+        Write-Host " $($Site.Url)" -NoNewLine
+
+
+        # Connect to SharePoint Online - most common reason for failure is no permssions this will add admin as a site collection admin of ot errors
+        try {
+            # Try to connect - will error if the global admin has no access to the site        
+            Connect-PnPOnline -Url $Site.Url -Interactive -ClientId $reuseConnection.ClientId 
+            ## Try something to make it fail - this next command requires site access
+            $web = Get-PnPWeb -Includes RoleAssignments, AssociatedMemberGroup, AssociatedOwnerGroup, AssociatedVisitorGroup
+            Write-Host " Successfully connected to SharePoint Online!" -ForegroundColor Green
+        }
+        catch {
+            ## Set global admin as an owner - this is only for the duration of looking at this site
+            Set-PnPSite -Owners $golbalAdminUserEmail 
+
+            # Set the flag for later use to remove the admin at then end of the loop
+            $wasGlobalAdminAddedAsOwner = $true
+    }
+
+    
+
+    #Retry to get the web if failed before
+    if(!$web)
+    {
+        #Get the specific web - note we have tried this already, but it may have failed before
+        $web = Get-PnPWeb -Includes RoleAssignments, AssociatedMemberGroup, AssociatedOwnerGroup, AssociatedVisitorGroup
+        #$web = Get-PnPWeb -Includes RoleAssignments
+    }
+
+    ##### Now loop through all of the lists in the site
+    # Get all lists and libraries in the site
+    $lists = Get-PnPList | Where-Object { $_.BaseTemplate -eq 100 -or $_.BaseTemplate -eq 101 -and $_.Title -ne "Content type publishing error log" -and $_.Title -ne "Form Templates" -and $_.Title -ne "Site Assets" -and $_.Title -ne "TaxonomyHiddenList" -and $_.Title -Notin("Site Pages","Style Library", "Preservation Hold Library")}
+
+    foreach ($list in $lists) {
+        if ($list.BaseType -eq "DocumentLibrary") {
+            
+            $listStorageMetric = Get-PnPFolderStorageMetric -List $list
+            # Check if versioning is enabled - of not no need to get the settings, if small list then ignore it
+            if ($list.EnableVersioning = $true -And $listStorageMetric.TotalSize -gt  $LargeFileSizeLowerLimit)
+            {
+                
+                $global:counter = 0;
+                $largeItems = Get-PnPListItem -List $list -PageSize 2000 -Fields ID, File_x0020_Type, File_x0020_Size, FileRef -ScriptBlock { Param($items) $global:counter += $items.Count; Write-Progress -PercentComplete ($global:Counter / (($list.ItemCount -eq 0) ? 1 : $list.ItemCount) * 100) -Activity "Getting Documents from Library '$($list.Title)'" -Status "Getting Documents data $global:Counter of $($list.ItemCount)";} | Where {$_.FileSystemObjectType -eq "File"}
+   
+                ##Dump Out the large list items 20 MB Here
+                $largeItems =  $largeItems | Where-Object { [long]$_["File_x0020_Size"] -gt $LargeFileSizeLowerLimit } 
+
+               if ($largeItems.Count -gt 0)
+                {
+                   
+                    ## Reset the big items object
+                    $objBigItems = @()
+                    foreach ($bigItem in $largeItems){
+                        $fileVersions = Get-PnPProperty -ClientObject $bigItem -Property Versions
+                        $bigFileName = Get-PnPProperty -ClientObject $bigItem -Property DisplayName
+                       
+ 
+                        $objbigItemInfo = $null
+                        $objbigItemInfo =[PSCustomObject]@{
+                            Versions =  $fileVersions.Count
+                            FileName =  $bigFileName
+                            Id = $bigItem.Id
+                            Size  = $bigItem.FieldValues["File_x0020_Size"]  
+                            Path = $bigItem.FieldValues["FileRef"]
+                            ListServerRelativeURl = $List.RootFolder.ServerRelativeUrl
+                            ListTitle = $list.Title
+                            WebTitle = $web.Title
+                         
+                        }
+                       
+                        $objBigItems  += $objbigItemInfo
+                    }
+                    
+                    $ListFilePath = ".\LArgeFiles4" +  $web.Title + "-" + $list.Title   + $ndate.year + $ndate.Month + $ndate.Day + $ndate.Hour + $ndate.Minute + ".csv"
+                    $objBigItems | Export-Csv -NoTypeInformation -Path $ListFilePath -Encoding UTF8   
+
+                }
+
+
+
+                # Set storage
+                $librarySize = Get-PnPFolderStorageMetric  -List $list
+
+                # Check enablement 
+                $versioningEnabled = $list.EnableVersioning
+                $minorVersioningEnabled = $list.EnableMinorVersions
+                $draftVersioninVisibility = $list.DraftVersionVisibility
+
+                # Capture the limits    
+                $majorVersionLimit = $list.MajorVersionLimit
+                $majorwithMinorVersionsLimit =  $list.MajorWithMinorVersionsLimit
+                
+                # Write out    
+                Write-Host "Library: $($list.Title)"
+                Write-Host "Versioning settings:"
+                Write-Host "  Versioning enabled: True"
+                Write-Host "  Minor versioning enabled: $($minorVersioningEnabled)"
+                Write-Host "  Draft versioning visibility: $($draftVersioninVisibility )"
+                Write-Host "  Major Version Limit: $($majorVersionLimit )"
+                Write-Host "  Major Minor Version Limit: $($majorwithMinorVersionsLimit )"
+                Write-Host "  Storage Size: $($librarySize )"
+                Write-Host "------------------------"
+
+                ## Build the object now
+
+                $objListInfo =[PSCustomObject]@{
+                    SiteURL = $web.Url
+                    ListTitle = $list.Title
+                    VersioningEnabled = $versioningEnabled
+                    MinorVersioningEnabled = $minorVersioningEnabled 
+                    DraftVersioningEnabled = $draftVersioningEnabled 
+  
+                    DraftListVersionsVisible = $draftListVersionsVisible
+                    MajorVersionLimit = $majorVersionLimit 
+                    MajorMinorVerionsLimit = $majorwithMinorVersionsLimit
+                    LibraryTotalSize = $librarySize.TotalSize # THis incluse all the metadata
+                    LibraryTotalStreamSize = $librarySize.TotalFileStreamSize # This is the stream size of just the files
+                    LibraryFileCOunt = $librarySize.TotalFileCount # Count of the items
+                }
+
+                    ## add it to the array
+                    $objAllData +=  $objListInfo 
+                    #Write-Host "URL: $($web.Url) SharePoint Owners: $($SPGroupOwners.Count) SharePoint Members: $($SPGroupMembers.Count) M365 Members: $siteM365GroupMembers M365 Owner: $siteM365GroupOwners All User Granted: $allUsersGrant"
+            } 
+            
+        }  
+    }
+    
+ 
+    #Remove any temp admin
+    if($wasGlobalAdminAddedAsOwner)
+    {
+        Remove-PnPSiteCollectionAdmin -Owners $golbalAdminUserEmail  
+    }
+
+    
+    
+    #output log in current itteration to save data captured.
+    $objAllData | Export-Csv -NoTypeInformation $outputFilePath -Encoding UTF8
+	
+	#### Reset the Web to NULL
+	$web = $null
+}
+}
+
+#Finally output all the data to a csv file
+$objAllData | Export-Csv -NoTypeInformation $outputFilePath -Encoding UTF8
+
+
+
+
+
