@@ -1,0 +1,94 @@
+#Check Modules are available
+######=Requires  SharePointPnPPowerShellOnline
+
+<#
+.SYNOPSIS
+This script outputs files which it suspects are dumplicates based on the hash of the file.
+.PARAMETER <ParameterName>
+    None as yet - just edit the start variable which will set the up the tenant connection, and the $siteUrls of the sites
+    you wish to check. Note that it will check for dupliicated across all of these sites.
+    If you select a large number of sites the data can be very large, so try to find site families to cut down the numbers
+.NOTES
+    <Additional notes>
+.EXAMPLE
+    Just run from the powershell command
+
+.Prerequisites
+ 
+Need PnP Powershell module
+Powershell Core V7.2 or later
+#>
+
+## PLease make sure that the account you run this script under is an owner of each of these sites
+$siteUrls = @(
+    "https://TENANT.sharepoint.com/sites/Valdis19",
+    "https://TENANT.sharepoint.com/sites/Zzzzz123123213"
+    
+)
+
+
+
+#$SiteURL = "https://TENANT.sharepoint.com/sites/Zzzzz123123213"
+$Pagesize = 2000
+$ReportOutput = ".\Duplicates" + $ndate.year + $ndate.Month + $ndate.Day + $ndate.Hour + $ndate.Minute + ".csv"
+ 
+#Connect to SharePoint Online site - first one
+$reuseConnection = Connect-PnPOnline $siteUrls[0] -Interactive -ReturnConnection 
+  
+#Array to store results - across all sites
+$DataCollection = @()
+ 
+foreach ($siteUrl in $siteUrls) 
+{
+    #Set the context
+    Write-Host "Connecting to site $($Site.Url)" -NoNewLine
+    
+    Connect-PnPOnline -Url $siteUrl -Interactive -ClientId $reuseConnection.ClientId 
+
+    #Get all Document libraries in the site
+    $DocumentLibraries = Get-PnPList | Where-Object {$_.BaseType -eq "DocumentLibrary" -and $_.Hidden -eq $false -and $_.ItemCount -gt 0 -and $_.Title -Notin("Site Pages","Style Library", "Preservation Hold Library")}
+    
+    #Iterate through each document library
+    ForEach($Library in $DocumentLibraries)
+    {    
+        #Get All documents from the library
+        $global:counter = 0;
+        $Documents = Get-PnPListItem -List $Library -PageSize $Pagesize -Fields ID, File_x0020_Type -ScriptBlock { Param($items) $global:counter += $items.Count; Write-Progress -PercentComplete ($global:Counter / ($Library.ItemCount) * 100) -Activity "Getting Documents from Library '$($Library.Title)'" -Status "Getting Documents data $global:Counter of $($Library.ItemCount)";} | Where {$_.FileSystemObjectType -eq "File"}
+    
+        $ItemCounter = 0
+        #Iterate through each document
+        Foreach($Document in $Documents)
+        {
+            #Get the File from Item
+            $File = Get-PnPProperty -ClientObject $Document -Property File
+            
+
+            try
+            {
+                #Get The File Hash
+                $Bytes = $File.OpenBinaryStream()
+                Invoke-PnPQuery
+                $MD5 = New-Object -TypeName System.Security.Cryptography.MD5CryptoServiceProvider
+                $HashCode = [System.BitConverter]::ToString($MD5.ComputeHash($Bytes.Value))
+        
+                #Collect data        
+                $Data = New-Object PSObject 
+                $Data | Add-Member -MemberType NoteProperty -name "FileName" -value $File.Name
+                $Data | Add-Member -MemberType NoteProperty -Name "HashCode" -value $HashCode
+                $Data | Add-Member -MemberType NoteProperty -Name "URL" -value $File.ServerRelativeUrl
+                $Data | Add-Member -MemberType NoteProperty -Name "FileSize" -value $File.Length        
+                $DataCollection += $Data
+                $ItemCounter++
+                Write-Progress -PercentComplete ($ItemCounter / ($Library.ItemCount) * 100) -Activity "Collecting data from Documents $ItemCounter of $($Library.ItemCount) from $($Library.Title)" -Status "Reading Data from Document '$($Document['FileLeafRef']) at '$($Document['FileRef'])"
+            }
+            catch{}
+        }
+    }
+}
+#Get Duplicate Files by Grouping Hash code
+$Duplicates = $DataCollection | Group-Object -Property HashCode | Where {$_.Count -gt 1}  | Select -ExpandProperty Group
+Write-host "Duplicate Files Based on File Hashcode:"
+$Duplicates | Format-table -AutoSize
+
+#Export the duplicates results to CSV
+$Duplicates | Export-Csv -Path $ReportOutput -NoTypeInformation
